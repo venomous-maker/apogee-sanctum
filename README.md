@@ -4,16 +4,15 @@ API tokens for [Apogee](https://github.com/venomous-maker) apps: personal access
 tokens limited to chosen abilities, with expiry, `last_used_at` and revocation,
 and session sign-in for the app's own single-page front end.
 
+In an apogee-framework app, importing the module is all it takes:
+`SanctumPackage` adds the `sanctum` guard (over the app's own users), the
+`abilities:` and `ability:` middleware, the `personal_access_tokens` migration
+(run it with `migrate`) and `sanctum:prune-expired`.
+
 ```grav
 import "std"
 import "apogee-sanctum"
 use apogee.*
-
-Sanctum.use(new DatabaseAccessTokenStore(pool))      // then .createTable(); memory by default
-Sanctum.provider = users                             // the app's UserProvider (finds owners by id)
-Sanctum.auth = auth
-auth.addGuard(new SanctumGuard("sanctum"))
-Sanctum.middleware(router)                           // abilities: and ability:
 
 let t = Sanctum.createToken(user, "deploy script", ["servers:read", "deploy"])
 print(t.plainText)                                   // "17|9f2c…": shown once, stored only as a hash
@@ -35,15 +34,28 @@ Sanctum.revoke(t.token.id)
   through `sessionGuard` ("web"). Such a request may do whatever its user may.
 - **Middleware:** `abilities:a,b` needs all of them, `ability:a,b` any one.
 
+## Settings
+
+| Setting | Default |
+|---|---|
+| `sanctum.expiration` | `SANCTUM_EXPIRATION`, minutes a new token lasts (0: until revoked) |
+| `sanctum.stateful` | `SANCTUM_STATEFUL_DOMAINS`, else localhost, 127.0.0.1 and `APP_URL`'s host |
+| `sanctum.guard` | `web`: the session guard for the front end |
+| `sanctum.touch_every`, `sanctum.cache_seconds` | 60, 5 |
+
 ## Stores
 
-`MemoryAccessTokenStore` and `DatabaseAccessTokenStore(pool, table = "personal_access_tokens")`
-on SQLite, MySQL/MariaDB or PostgreSQL.
+`PersonalAccessToken` is an Orbit model (`personal_access_tokens`, made by
+`CreatePersonalAccessTokensTable`), kept by `OrbitAccessTokenStore` in the app's
+database (SQLite, MySQL/MariaDB or PostgreSQL). `MemoryAccessTokenStore` is for
+tests. Outside the framework, set `Sanctum.use(store)`, `Sanctum.provider`,
+`Sanctum.auth`, and add `new SanctumGuard("sanctum")` yourself.
 
 ## Tests
 
 ```sh
 grav test tests/sanctum.grav
+grav test tests/package.grav
 SANCTUM_MYSQL_URL=mysql://… SANCTUM_POSTGRES_URL=postgres://… grav test tests/sanctum.grav
 ```
 
