@@ -1,0 +1,186 @@
+// sanctum.grav — API tokens for an app's users and its single-page front end:
+//
+//   let t = Sanctum.createToken(user, "deploy script", ["servers:read", "deploy"])
+//   print(t.plainText)                                   // "17|9f2c..." — shown once
+//   auth.addGuard(new SanctumGuard("sanctum"))           // Authorization: Bearer 17|9f2c...
+//   router.middleware(["auth:sanctum", "abilities:deploy"]).post("/deploy", deploy)
+//   Sanctum.tokenCan(req, "servers:read")
+//
+// A request without a token from one of `stateful`'s hosts (the app's own
+// front end) is signed in by the session cookie instead, through `sessionGuard`.
+import "std"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-auth"
+import "tokens.grav"
+
+namespace apogee {
+
+    // A token just made: the stored record and the text to hand over (once).
+    class NewAccessToken {
+        public token: PersonalAccessToken
+        public plainText: string
+        constructor(token: PersonalAccessToken, plainText: string) { self.token = token; self.plainText = plainText; }
+    }
+
+    class CachedToken {
+        public token: PersonalAccessToken
+        public at: long
+        constructor(token: PersonalAccessToken, at: long) { self.token = token; self.at = at; }
+    }
+
+    class Sanctum {
+        static store: AccessTokenStore = new MemoryAccessTokenStore()
+        // Finds a token's owner by id (the app's user provider).
+        static provider: UserProvider = null
+        // The app's AuthManager (for the session fallback).
+        static auth: AuthManager = null
+        static sessionGuard: string = "web"
+        // Hosts of the app's own front end, signed in by the session cookie.
+        static stateful: Array<string> = ["localhost", "127.0.0.1"]
+        // Minutes a new token lasts when no expiry is given (0: until revoked).
+        static expirationMinutes: long = 0
+        // last_used_at is written at most this often per token (seconds), not on every request.
+        static touchEverySeconds: long = 60
+        // Seconds a looked-up token is kept in memory (revoking here drops it at once).
+        static cacheSeconds: long = 5
+        private static cache: ConcurrentMap<long, CachedToken> = new ConcurrentMap<long, CachedToken>()
+
+        // Keeps tokens in `store` (and forgets what was cached from the last one).
+        static fn use(store: AccessTokenStore) { Sanctum.store = store; Sanctum.cache.clear(); }
+        // The owner of a token: its class name and id.
+        static fn ownerType(user: any) -> string { let info = ClassInfo.of(user); return info == null ? typename(user) : info.name; }
+        static fn ownerId(user: any) -> string { return (user as Authenticatable).authId(); }
+
+        // A new token for `user` (abilities ["*"]: anything; expiresAt in unix seconds, 0 for the default).
+        static fn createToken(user: any, name: string, abilities: Array<string> = ["*"], expiresAt: long = 0) -> NewAccessToken {
+            let t = new PersonalAccessToken();
+            t.ownerType = Sanctum.ownerType(user);
+            t.ownerId = Sanctum.ownerId(user);
+            t.name = name;
+            t.abilities = abilities.copy();
+            t.createdAt = Time.now();
+            t.expiresAt = expiresAt > 0 ? expiresAt : (Sanctum.expirationMinutes > 0 ? t.createdAt + Sanctum.expirationMinutes * 60 : 0);
+            let secret = Hash.randomToken(20);
+            t.tokenHash = Hash.sha256(secret);
+            Sanctum.store.insert(t);
+            return new NewAccessToken(t, str(t.id) + "|" + secret);
+        }
+        static fn tokensOf(user: any) -> Array<PersonalAccessToken> { return Sanctum.store.ofOwner(Sanctum.ownerType(user), Sanctum.ownerId(user)); }
+        // Revokes one token (by id); whether it existed.
+        static fn revoke(id: long) -> bool { Sanctum.cache.remove(id); return Sanctum.store.delete(id); }
+        // Revokes every token of `user`; how many.
+        static fn revokeAll(user: any) -> long {
+            for (t in Sanctum.tokensOf(user)) { Sanctum.cache.remove(t.id); }
+            return Sanctum.store.deleteOfOwner(Sanctum.ownerType(user), Sanctum.ownerId(user));
+        }
+        // Removes tokens that expired more than `hours` ago; how many.
+        static fn prune(hours: long = 24) -> long { return Sanctum.store.pruneExpired(Time.now() - hours * 3600); }
+
+        // The live token for "id|secret" text, or null (malformed, unknown, wrong secret, expired).
+        static fn findToken(plain: string) -> PersonalAccessToken {
+            let bar = Str.indexOf(plain, "|");
+            if (bar < 1) { return null; }
+            let idText = plain[..bar];
+            if (!Str.isDigits(idText) || idText.length > 18) { return null; }
+            let id = Format.toLongOr(idText, 0);
+            let now = Time.now();
+            let nowMs = Time.monotonicMs();
+            let c = Sanctum.cache.getOr(id, null);
+            let t: PersonalAccessToken = null;
+            if (c != null && nowMs - c.at < Sanctum.cacheSeconds * 1000) { t = c.token; }
+            else {
+                t = Sanctum.store.find(id);
+                if (t == null) { Sanctum.cache.remove(id); return null; }
+                Sanctum.cache.put(id, new CachedToken(t, nowMs));
+            }
+            if (!Hash.equals(t.tokenHash, Hash.sha256(plain[bar + 1..])) || t.expired(now)) { return null; }
+            if (now - t.lastUsedAt >= Sanctum.touchEverySeconds) {
+                t.lastUsedAt = now;
+                try { Sanctum.store.touch(t.id, now); } catch (e: Exception) {}
+            }
+            return t;
+        }
+        // The token the request was signed in with (null for a session or none).
+        static fn currentToken(req: Request) -> PersonalAccessToken {
+            let t = req.get("sanctum.token", null);
+            return t == null ? null : t as PersonalAccessToken;
+        }
+        // Whether the request may do `ability`: its token has it, or it was signed in
+        // by the session (the app's own front end may do what its user may).
+        static fn tokenCan(req: Request, ability: string) -> bool {
+            let t = Sanctum.currentToken(req);
+            if (t != null) { return t.can(ability); }
+            return req.user != null;
+        }
+        // Whether the request comes from one of `stateful`'s hosts (Origin, else Referer).
+        static fn fromFrontend(req: Request) -> bool {
+            let from = req.header("Origin");
+            if (from == "") { from = req.header("Referer"); }
+            if (from == "") { return false; }
+            let host = from;
+            let scheme = Str.indexOf(host, "://");
+            if (scheme >= 0) { host = host[scheme + 3..]; }
+            let slash = Str.indexOf(host, "/");
+            if (slash >= 0) { host = host[..slash]; }
+            let colon = Str.lastIndexOf(host, ":");
+            let bare = colon > 0 ? host[..colon] : host;
+            return Sanctum.stateful.contains(Str.lower(host)) || Sanctum.stateful.contains(Str.lower(bare));
+        }
+        // The `abilities:a,b` (all of them) and `ability:a,b` (any) middleware.
+        static fn middleware(r: Router) {
+            r.aliasMiddleware("abilities", fn(a: Array<string>) -> Middleware { return new CheckAbilities(a, true); });
+            r.aliasMiddleware("ability", fn(a: Array<string>) -> Middleware { return new CheckAbilities(a, false); });
+        }
+    }
+
+    // Signs requests in by a bearer token, or (from the app's own front end) by the session.
+    class SanctumGuard implements Guard {
+        private guardName: string
+        constructor(name: string = "sanctum") { self.guardName = name; }
+        fn name() -> string { return self.guardName; }
+        fn user(req: Request) -> any {
+            if (req.user != null && req.get("auth.guard") == self.guardName as any) { return req.user; }
+            let bearer = req.bearerToken();
+            if (bearer != "") {
+                if (Sanctum.provider == null) { throw new StateError("set Sanctum.provider (the app's user provider)"); }
+                let t = Sanctum.findToken(bearer);
+                if (t == null) { return null; }
+                let u = Sanctum.provider.retrieveById(t.ownerId);
+                if (u == null || Sanctum.ownerType(u) != t.ownerType) { return null; }
+                req.user = u;
+                req.set("auth.guard", self.guardName);
+                req.set("sanctum.token", t);
+                return u;
+            }
+            if (Sanctum.auth != null && Sanctum.fromFrontend(req)) {
+                let u = Sanctum.auth.guard(Sanctum.sessionGuard).user(req);
+                if (u != null) { req.set("auth.guard", self.guardName); }
+                return u;
+            }
+            return null;
+        }
+        fn validate(credentials: HashMap<string, any>) -> bool {
+            let t = credentials.getOr("token", null);
+            return t != null && Sanctum.findToken(str(t)) != null;
+        }
+    }
+
+    // `abilities:a,b` (every one) or `ability:a,b` (any one): 403 when the token lacks them.
+    class CheckAbilities implements Middleware {
+        private names: Array<string>
+        private all: bool
+        constructor(names: Array<string>, all: bool) { self.names = names; self.all = all; }
+        fn handle(req: Request, next: fn(Request) -> Response) -> Response {
+            if (req.user == null) { throw new HttpException(401); }
+            let ok = self.all;
+            for (n in self.names) {
+                let can = Sanctum.tokenCan(req, n);
+                if (self.all && !can) { ok = false; }
+                if (!self.all && can) { ok = true; }
+            }
+            if (!ok) { throw new HttpException(403, "This token cannot do that."); }
+            return next(req);
+        }
+    }
+}
