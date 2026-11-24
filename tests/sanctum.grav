@@ -9,9 +9,11 @@ import "apogee-session"
 import "apogee-auth"
 import "apogee-testing"
 import "grav-db"
+import "grav-orbit"
 import "../src/all.grav"
 use apogee.*
 use db.*
+use orbit.*
 
 class Member implements Authenticatable {
     public id: long
@@ -85,22 +87,18 @@ fn exercise(store: AccessTokenStore) {
 
 test "the memory store" { exercise(new MemoryAccessTokenStore()) }
 
-test "the database store (SQLite), and MySQL and PostgreSQL when given" {
+test "the Orbit store (SQLite), and MySQL and PostgreSQL when given" {
     let file = Dir.temp() + "/sanctum_test_" + str(Process.pid()) + ".sqlite"
     new File(file).delete()
-    let s = new DatabaseAccessTokenStore(new Pool(2, fn() -> Connection { return Sqlite.open(file) }))
-    s.createTable()
-    s.createTable()
-    exercise(s)
+    DB.connect(Sqlite.open(file))
+    new CreatePersonalAccessTokensTable().up()
+    exercise(new OrbitAccessTokenStore())
     new File(file).delete()
     for (url in [env("SANCTUM_MYSQL_URL"), env("SANCTUM_POSTGRES_URL")]) {
         if (url == "") { continue }
-        let pool = new Pool(2, fn() -> Connection { return Str.startsWith(url, "mysql") ? MySql.open(url) as Connection : Postgres.open(url) as Connection })
-        let conn = pool.acquire()
-        conn.exec("DROP TABLE IF EXISTS personal_access_tokens")
-        pool.release(conn)
-        let ds = new DatabaseAccessTokenStore(pool)
-        ds.createTable()
-        exercise(ds)
+        DB.connect(Str.startsWith(url, "mysql") ? MySql.open(url) as Connection : Postgres.open(url) as Connection)
+        new CreatePersonalAccessTokensTable().down()
+        new CreatePersonalAccessTokensTable().up()
+        exercise(new OrbitAccessTokenStore())
     }
 }

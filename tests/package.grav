@@ -1,0 +1,56 @@
+// SanctumPackage connects itself: found by discovery, its defaults applied,
+// its migration and command offered, and on boot the `sanctum` guard (over
+// the session guard's own users) and the ability middleware are in place.
+import "std"
+import "apogee-container"
+import "apogee-config"
+import "apogee-package"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-auth"
+import "apogee-testing"
+import "grav-orbit"
+import "../src/all.grav"
+use apogee.*
+use orbit.*
+
+class Member implements Authenticatable {
+    public id: long
+    constructor(id: long) { self.id = id }
+    fn authId() -> string { return str(self.id) }
+    fn authPassword() -> string { return "" }
+}
+
+test "the package connects itself" {
+    let ps = Packages.discover()
+    assertEq(ps.size(), 1)
+    let p = ps[0]
+    assertEq(p.name(), "sanctum")
+    Config.set("sanctum.expiration", 30)
+    Packages.applyDefaults(ps)
+    assertEq(Config.getString("sanctum.guard", ""), "web")
+    assertEq(Config.getInt("sanctum.expiration", 0), 30 as long)               // the app's own value stays
+    assertEq(p.migrations().size(), 1)
+    assertEq(p.commands().size(), 1)
+    // what the framework would have bound
+    let file = Dir.temp() + "/sanctum_pkg_" + str(Process.pid()) + ".sqlite"
+    new File(file).delete()
+    DB.connect(Sqlite.open(file))
+    (p.migrations()[0] as Migration).up()
+    let c = new Container()
+    let users = new MemoryUserProvider([new Member(1) as any])
+    let auth = new AuthManager(new Gate())
+    auth.addGuard(new SessionGuard("web", users, new CookieJar("k")))
+    c.instance::<AuthManager>(auth)
+    let r = new Router(c)
+    c.instance::<Router>(r)
+    p.register(new PackageContext(c, "testing", "key"))
+    p.boot(new PackageContext(c, "testing", "key"))
+    assertEq(Sanctum.expirationMinutes, 30 as long)
+    r.aliasMiddleware("auth", fn(a: Array<string>) -> Middleware { return new Authenticate(auth, a) })
+    r.get("/me", fn(req: Request) -> Response { return Response.json({"id": (req.user as Member).id}) }).middleware(["auth:sanctum", "ability:read"])
+    let t = Sanctum.createToken(new Member(1), "cli", ["read"])
+    assert(t.token.expiresAt > Time.now())
+    new TestClient(new HttpKernel(r)).withHeader("Authorization", "Bearer " + t.plainText).getJson("/me").assertOk().assertJsonPath("id", 1)
+    new File(file).delete()
+}
