@@ -1,0 +1,62 @@
+// package.grav — how Sanctum connects itself to an app (apogee-package):
+// its settings, the personal_access_tokens migration, the `sanctum` guard
+// (over the app's own user provider), the abilities: and ability: middleware,
+// and the sanctum:prune-expired command.
+import "std"
+import "apogee-config"
+import "apogee-package"
+import "apogee-routing"
+import "apogee-console"
+import "apogee-auth"
+import "tokens.grav"
+import "sanctum.grav"
+
+namespace apogee {
+
+    class SanctumPackage extends ApogeePackage {
+        constructor() {}
+        fn name() -> string { return "sanctum"; }
+        fn defaults() -> HashMap<string, any> {
+            let url = Env.get("APP_URL", "http://localhost");
+            let host = Str.after(url, "://");
+            if (Str.contains(host, "/")) { host = Str.before(host, "/"); }
+            return {"sanctum.expiration": Env.getInt("SANCTUM_EXPIRATION", 0),
+                    "sanctum.stateful": Env.get("SANCTUM_STATEFUL_DOMAINS", "localhost,127.0.0.1," + host),
+                    "sanctum.guard": Env.get("SANCTUM_GUARD", "web"),
+                    "sanctum.touch_every": 60,
+                    "sanctum.cache_seconds": 5};
+        }
+        fn migrations() -> Array<any> { return [new CreatePersonalAccessTokensTable() as any]; }
+        fn commands() -> Array<any> { return [new PruneTokensCommand() as any]; }
+        fn boot(app: PackageContext) {
+            Sanctum.use(new OrbitAccessTokenStore());
+            Sanctum.expirationMinutes = Config.getInt("sanctum.expiration", 0);
+            Sanctum.touchEverySeconds = Config.getInt("sanctum.touch_every", 60);
+            Sanctum.cacheSeconds = Config.getInt("sanctum.cache_seconds", 5);
+            Sanctum.sessionGuard = Config.getString("sanctum.guard", "web");
+            let hosts = new Array<string>();
+            for (h in Str.split(Config.getString("sanctum.stateful", ""), ",")) { if (Str.trim(h) != "") { hosts.push(Str.lower(Str.trim(h))); } }
+            Sanctum.stateful = hosts;
+            let auth = app.make::<AuthManager>();
+            Sanctum.auth = auth;
+            // (owners are found by the session guard's own user provider)
+            try {
+                let g = auth.guard(Sanctum.sessionGuard);
+                if (g is SessionGuard) { Sanctum.provider = (g as SessionGuard).provider; }
+            } catch (e: StateError) {}
+            auth.addGuard(new SanctumGuard("sanctum"));
+            Sanctum.middleware(app.make::<Router>());
+        }
+    }
+
+    class PruneTokensCommand extends ConsoleCommand {
+        constructor() {}
+        fn signature() -> string { return "sanctum:prune-expired {--hours=24 : Keep tokens that expired within this many hours}"; }
+        fn description() -> string { return "Remove expired personal access tokens"; }
+        fn handle() -> int {
+            let hours = self.option("hours") != "" ? self.optionInt("hours") : 24 as long;
+            self.output.writeln("<info>Removed ${Sanctum.prune(hours)} expired tokens.</>");
+            return 0;
+        }
+    }
+}

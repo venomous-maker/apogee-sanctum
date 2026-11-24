@@ -1,3 +1,4 @@
-// all.grav — apogee-sanctum: personal access tokens and the SPA session fallback.
+// all.grav — apogee-sanctum: personal access tokens, the SPA session fallback, and its package.
 import "tokens.grav"
 import "sanctum.grav"
+import "package.grav"
