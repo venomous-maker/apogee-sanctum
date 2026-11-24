@@ -1,0 +1,106 @@
+// apogee-sanctum's tests: tokens through the guard and the router (abilities,
+// a wrong secret, expiry, revoking), last_used_at written at most once a
+// minute, the session fallback for the app's own front end, and both stores.
+import "std"
+import "apogee-container"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-session"
+import "apogee-auth"
+import "apogee-testing"
+import "grav-db"
+import "../src/all.grav"
+use apogee.*
+use db.*
+
+class Member implements Authenticatable {
+    public id: long
+    public email: string
+    constructor(id: long, email: string) { self.id = id; self.email = email }
+    fn authId() -> string { return str(self.id) }
+    fn authPassword() -> string { return "" }
+}
+
+class World { static ada: Member = new Member(1, "ada@x.test")  static bob: Member = new Member(2, "bob@x.test") }
+
+fn app(store: AccessTokenStore) -> HttpKernel {
+    Sanctum.use(store)
+    let users = new MemoryUserProvider([World.ada as any, World.bob as any])
+    Sanctum.provider = users
+    let auth = new AuthManager(new Gate())
+    auth.addGuard(new SessionGuard("web", users, new CookieJar("k")))
+    auth.addGuard(new SanctumGuard("sanctum"))
+    Sanctum.auth = auth
+    let r = new Router(new Container())
+    r.aliasInstance("session", new StartSession(new SessionManager(new MemorySessionStore(), "k")))
+    r.aliasMiddleware("auth", fn(a: Array<string>) -> Middleware { return new Authenticate(auth, a) })
+    Sanctum.middleware(r)
+    r.middleware(["session"]).group(fn(g: Router) {
+        g.post("/spa-login", fn(req: Request) -> Response { auth.session().login(req, World.ada); return Response.json({"ok": true}) })
+        g.get("/me", fn(req: Request) -> Response { return Response.json({"email": (req.user as Member).email}) }).middleware(["auth:sanctum"])
+        g.post("/deploy", fn(req: Request) -> Response { return Response.json({"deployed": true}) }).middleware(["auth:sanctum", "abilities:deploy,servers:read"])
+        g.get("/servers", fn(req: Request) -> Response { return Response.json({"ok": true}) }).middleware(["auth:sanctum", "ability:servers:read,servers:admin"])
+    })
+    return new HttpKernel(r)
+}
+
+fn exercise(store: AccessTokenStore) {
+    let k = app(store)
+    let c = new TestClient(k)
+    let all = Sanctum.createToken(World.ada, "cli")
+    assert(Str.contains(all.plainText, "|") && all.token.id > 0)
+    let limited = Sanctum.createToken(World.bob, "monitor", ["servers:read"])
+    c.withHeader("Authorization", "Bearer " + all.plainText).getJson("/me").assertOk().assertJsonPath("email", "ada@x.test")
+    let ok = new TestClient(k)
+    ok.withHeader("Authorization", "Bearer " + all.plainText).postJson("/deploy", null).assertOk()
+    let mon = new TestClient(k)
+    mon.withHeader("Authorization", "Bearer " + limited.plainText)
+    mon.getJson("/servers").assertOk()
+    mon.postJson("/deploy", null).assertForbidden()
+    // a wrong secret, a token that does not exist, garbage
+    for (bad in [str(all.token.id) + "|wrong", "99999|" + Str.after(all.plainText, "|"), "nonsense"]) {
+        new TestClient(k).withHeader("Authorization", "Bearer " + bad).getJson("/me").assertStatus(401)
+    }
+    // expired
+    let old = Sanctum.createToken(World.ada, "old", ["*"], Time.now() - 1)
+    new TestClient(k).withHeader("Authorization", "Bearer " + old.plainText).getJson("/me").assertStatus(401)
+    // listing and revoking
+    assertEq(Sanctum.tokensOf(World.ada).size(), 2)
+    assert(Sanctum.revoke(all.token.id))
+    new TestClient(k).withHeader("Authorization", "Bearer " + all.plainText).getJson("/me").assertStatus(401)
+    assertEq(Sanctum.revokeAll(World.ada), 1 as long)
+    assertEq(Sanctum.tokensOf(World.ada).size(), 0)
+    // last_used_at: set on first use, not rewritten within the minute
+    let t = Sanctum.findToken(limited.plainText)
+    assert(t != null && t.lastUsedAt > 0)
+    let first = Sanctum.store.find(limited.token.id).lastUsedAt
+    assert(first > 0)
+    // the app's own front end, by its session cookie
+    let spa = new TestClient(k)
+    spa.postJson("/spa-login", null).assertOk()
+    spa.getJson("/me").assertStatus(401)                                   // no Origin: not the front end
+    spa.withHeader("Origin", "http://localhost:5173").getJson("/me").assertOk().assertJsonPath("email", "ada@x.test")
+    spa.withHeader("Origin", "https://evil.test").getJson("/me").assertStatus(401)
+}
+
+test "the memory store" { exercise(new MemoryAccessTokenStore()) }
+
+test "the database store (SQLite), and MySQL and PostgreSQL when given" {
+    let file = Dir.temp() + "/sanctum_test_" + str(Process.pid()) + ".sqlite"
+    new File(file).delete()
+    let s = new DatabaseAccessTokenStore(new Pool(2, fn() -> Connection { return Sqlite.open(file) }))
+    s.createTable()
+    s.createTable()
+    exercise(s)
+    new File(file).delete()
+    for (url in [env("SANCTUM_MYSQL_URL"), env("SANCTUM_POSTGRES_URL")]) {
+        if (url == "") { continue }
+        let pool = new Pool(2, fn() -> Connection { return Str.startsWith(url, "mysql") ? MySql.open(url) as Connection : Postgres.open(url) as Connection })
+        let conn = pool.acquire()
+        conn.exec("DROP TABLE IF EXISTS personal_access_tokens")
+        pool.release(conn)
+        let ds = new DatabaseAccessTokenStore(pool)
+        ds.createTable()
+        exercise(ds)
+    }
+}
