@@ -1,40 +1,67 @@
-// tokens.grav — personal access tokens: what is stored (only a hash of the
-// secret), and where (memory, or a table on SQLite, MySQL or PostgreSQL).
+// tokens.grav — personal access tokens: an Orbit model (only a hash of the
+// secret is stored), its migration, and where tokens are kept (the app's
+// database through Orbit, or memory for tests).
 import "std"
-import "grav-db"
-use db.*
+import "grav-orbit"
+use orbit.*
 
 namespace apogee {
 
-    class PersonalAccessToken {
+    // A token, as a row of personal_access_tokens.
+    class PersonalAccessToken extends Model {
         public id: long = 0
         // The owner: its class name and id ("app.User", "42").
         public ownerType: string = ""
         public ownerId: string = ""
         public name: string = ""
         public tokenHash: string = ""
-        // What the token may do (["*"]: anything).
-        public abilities: Array<string> = new Array<string>()
+        // What the token may do, comma-separated ("*": anything).
+        public abilities: string = "*"
         // Unix seconds (0: never used / never expires).
         public lastUsedAt: long = 0
         public expiresAt: long = 0
-        public createdAt: long = 0
+        public issuedAt: long = 0
         constructor() {}
-        fn can(ability: string) -> bool { return self.abilities.contains("*") || self.abilities.contains(ability); }
+        // (a check scans the text: no list is made for it)
+        fn can(ability: string) -> bool {
+            if (self.abilities == "*") { return true; }
+            return Str.contains("," + self.abilities + ",", "," + ability + ",") || Str.contains("," + self.abilities + ",", ",*,");
+        }
         fn cant(ability: string) -> bool { return !self.can(ability); }
+        fn abilityList() -> Array<string> { return Str.split(self.abilities, ","); }
         fn expired(now: long) -> bool { return self.expiresAt > 0 && now >= self.expiresAt; }
-        fn toJson() -> JsonValue {
+        // The token as shown to its owner (no hash).
+        fn summary() -> JsonValue {
             let o = Json.object();
             o.set("id", self.id);
             o.set("name", self.name);
             let a = Json.array();
-            for (x in self.abilities) { a.push(x); }
+            for (x in self.abilityList()) { a.push(x); }
             o.set("abilities", a);
             o.set("last_used_at", self.lastUsedAt);
             o.set("expires_at", self.expiresAt);
-            o.set("created_at", self.createdAt);
+            o.set("issued_at", self.issuedAt);
             return o;
         }
+    }
+
+    class CreatePersonalAccessTokensTable extends Migration {
+        constructor() {}
+        fn up() {
+            Schema.create("personal_access_tokens", fn(t: Blueprint) {
+                t.id();
+                t.varchar("owner_type", 190);
+                t.varchar("owner_id", 64);
+                t.varchar("name");
+                t.varchar("token_hash", 64);
+                t.text("abilities");
+                t.bigInteger("last_used_at").defaultValue(0);
+                t.bigInteger("expires_at").defaultValue(0);
+                t.bigInteger("issued_at").defaultValue(0);
+                t.index(["owner_type", "owner_id"]);
+            });
+        }
+        fn down() { Schema.dropIfExists("personal_access_tokens"); }
     }
 
     interface AccessTokenStore {
@@ -47,6 +74,21 @@ namespace apogee {
         fn deleteOfOwner(ownerType: string, ownerId: string) -> long
         // Removes tokens that expired before `before` (unix seconds); how many.
         fn pruneExpired(before: long) -> long
+    }
+
+    // In the app's database, through Orbit (personal_access_tokens; see the migration).
+    class OrbitAccessTokenStore implements AccessTokenStore {
+        constructor() {}
+        private fn q() -> Query<PersonalAccessToken> { return new Query<PersonalAccessToken>(TableMap.of(reflect(PersonalAccessToken))); }
+        fn insert(t: PersonalAccessToken) { t.save(); }
+        fn find(id: long) -> PersonalAccessToken { return self.q().firstWhere("id", id); }
+        fn ofOwner(ownerType: string, ownerId: string) -> Array<PersonalAccessToken> {
+            return self.q().where("owner_type", ownerType).where("owner_id", ownerId).orderBy("id").get();
+        }
+        fn touch(id: long, at: long) { self.q().where("id", id).update({"last_used_at": at}); }
+        fn delete(id: long) -> bool { return self.q().where("id", id).delete() > 0; }
+        fn deleteOfOwner(ownerType: string, ownerId: string) -> long { return self.q().where("owner_type", ownerType).where("owner_id", ownerId).delete(); }
+        fn pruneExpired(before: long) -> long { return self.q().where("expires_at", ">", 0).where("expires_at", "<", before).delete(); }
     }
 
     // In this process's memory (development, tests). Thread-safe.
@@ -79,83 +121,6 @@ namespace apogee {
             self.lock.lock();
             for (k in self.rows.keys()) { let t = self.rows.get(k); if (t.expiresAt > 0 && t.expiresAt < before) { self.rows.remove(k); n += 1; } }
             self.lock.unlock();
-            return n;
-        }
-    }
-
-    // In a table `personal_access_tokens`.
-    class DatabaseAccessTokenStore implements AccessTokenStore {
-        public table: string
-        private pool: Pool
-        constructor(pool: Pool, table: string = "personal_access_tokens") { self.pool = pool; self.table = table; }
-        private fn with(f: fn(Connection)) {
-            let c = self.pool.acquire();
-            try { f(c); } finally { self.pool.release(c); }
-        }
-        fn createTable() {
-            self.with(fn(c: Connection) {
-                let id = c.driver() == "postgres" ? "BIGSERIAL PRIMARY KEY" : (c.driver() == "mysql" ? "BIGINT AUTO_INCREMENT PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT");
-                c.exec("CREATE TABLE IF NOT EXISTS " + self.table + " (id " + id + ", owner_type VARCHAR(190) NOT NULL, owner_id VARCHAR(64) NOT NULL, " +
-                       "name VARCHAR(255) NOT NULL, token_hash VARCHAR(64) NOT NULL, abilities TEXT NOT NULL, last_used_at BIGINT NOT NULL, " +
-                       "expires_at BIGINT NOT NULL, created_at BIGINT NOT NULL)");
-                if (c.driver() != "mysql") {
-                    c.exec("CREATE INDEX IF NOT EXISTS " + self.table + "_owner ON " + self.table + " (owner_type, owner_id)");
-                }
-            });
-        }
-        private static fn abilitiesText(a: Array<string>) -> string { let j = Json.array(); for (x in a) { j.push(x); } return j.toJson(); }
-        private static fn of(r: Row) -> PersonalAccessToken {
-            let t = new PersonalAccessToken();
-            t.id = Format.toLongOr(str(r.get("id")), 0);
-            t.ownerType = r.getString("owner_type");
-            t.ownerId = r.getString("owner_id");
-            t.name = r.getString("name");
-            t.tokenHash = r.getString("token_hash");
-            let a = Json.tryParse(r.getString("abilities"));
-            if (a != null && a.isArray()) { for (x in a.asArray()) { t.abilities.push(x.asString()); } }
-            t.lastUsedAt = Format.toLongOr(str(r.get("last_used_at")), 0);
-            t.expiresAt = Format.toLongOr(str(r.get("expires_at")), 0);
-            t.createdAt = Format.toLongOr(str(r.get("created_at")), 0);
-            return t;
-        }
-        fn insert(t: PersonalAccessToken) {
-            self.with(fn(c: Connection) {
-                let sql = "INSERT INTO " + self.table + " (owner_type, owner_id, name, token_hash, abilities, last_used_at, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-                let args: Array<any> = [t.ownerType, t.ownerId, t.name, t.tokenHash, DatabaseAccessTokenStore.abilitiesText(t.abilities), t.lastUsedAt, t.expiresAt, t.createdAt];
-                if (c.driver() == "postgres") {
-                    t.id = Format.toLongOr(str(c.queryValue(sql + " RETURNING id", args)), 0);
-                } else {
-                    c.execute(sql, args);
-                    t.id = Format.toLongOr(str(c.queryValue(c.driver() == "mysql" ? "SELECT LAST_INSERT_ID()" : "SELECT last_insert_rowid()", new Array<any>())), 0);
-                }
-            });
-        }
-        fn find(id: long) -> PersonalAccessToken {
-            let out: PersonalAccessToken = null;
-            self.with(fn(c: Connection) { for (r in c.query("SELECT * FROM " + self.table + " WHERE id = ?", [id])) { out = DatabaseAccessTokenStore.of(r); } });
-            return out;
-        }
-        fn ofOwner(ownerType: string, ownerId: string) -> Array<PersonalAccessToken> {
-            let out = new Array<PersonalAccessToken>();
-            self.with(fn(c: Connection) {
-                for (r in c.query("SELECT * FROM " + self.table + " WHERE owner_type = ? AND owner_id = ? ORDER BY id", [ownerType, ownerId])) { out.push(DatabaseAccessTokenStore.of(r)); }
-            });
-            return out;
-        }
-        fn touch(id: long, at: long) { self.with(fn(c: Connection) { c.execute("UPDATE " + self.table + " SET last_used_at = ? WHERE id = ?", [at, id]); }); }
-        fn delete(id: long) -> bool {
-            let n: long = 0;
-            self.with(fn(c: Connection) { n = c.execute("DELETE FROM " + self.table + " WHERE id = ?", [id]); });
-            return n > 0;
-        }
-        fn deleteOfOwner(ownerType: string, ownerId: string) -> long {
-            let n: long = 0;
-            self.with(fn(c: Connection) { n = c.execute("DELETE FROM " + self.table + " WHERE owner_type = ? AND owner_id = ?", [ownerType, ownerId]); });
-            return n;
-        }
-        fn pruneExpired(before: long) -> long {
-            let n: long = 0;
-            self.with(fn(c: Connection) { n = c.execute("DELETE FROM " + self.table + " WHERE expires_at > 0 AND expires_at < ?", [before]); });
             return n;
         }
     }
