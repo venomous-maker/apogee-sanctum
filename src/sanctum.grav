@@ -58,9 +58,10 @@ namespace apogee {
             t.ownerType = Sanctum.ownerType(user);
             t.ownerId = Sanctum.ownerId(user);
             t.name = name;
-            t.abilities = abilities.copy();
-            t.createdAt = Time.now();
-            t.expiresAt = expiresAt > 0 ? expiresAt : (Sanctum.expirationMinutes > 0 ? t.createdAt + Sanctum.expirationMinutes * 60 : 0);
+            for (a in abilities) { if (Str.contains(a, ",")) { throw new ValueError("an ability cannot contain ',': " + a); } }
+            t.abilities = abilities.isEmpty() ? "" : Str.join(abilities, ",");
+            t.issuedAt = Time.now();
+            t.expiresAt = expiresAt > 0 ? expiresAt : (Sanctum.expirationMinutes > 0 ? t.issuedAt + Sanctum.expirationMinutes * 60 : 0);
             let secret = Hash.randomToken(20);
             t.tokenHash = Hash.sha256(secret);
             Sanctum.store.insert(t);
