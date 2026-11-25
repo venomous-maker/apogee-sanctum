@@ -12,6 +12,7 @@ apogee-console = "github.com/venomous-maker/apogee-console@v0.2.1"
 apogee-package = { path = "/home/venom/CLionProjects/Practice/apogee-package" }
 grav-orbit = "github.com/venomous-maker/grav-orbit@v0.2.0"
 grav-db = "github.com/venomous-maker/grav-db@v0.2.0"
+grav-cache = "github.com/venomous-maker/grav-cache@v0.2.1"
 # (the tests drive the guard through the router)
 apogee-container = "github.com/venomous-maker/apogee-container@v0.2.0"
 apogee-session = "github.com/venomous-maker/apogee-session@v0.2.1"
