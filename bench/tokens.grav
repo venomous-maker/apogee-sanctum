@@ -15,6 +15,8 @@ class Member implements Authenticatable {
 }
 class B {
     static plain: string = ""
+    static sharedPlain: string = ""
+    static storePlain: string = ""
     static token: PersonalAccessToken = null
     static text: string = ""
     static n: long = 0
@@ -23,6 +25,9 @@ class B {
         Sanctum.use(new MemoryAccessTokenStore())
         let t = Sanctum.createToken(new Member(42), "deploy script", ["servers:read", "deploy"], Time.now() + 86400)
         B.plain = t.plainText
+        // (each way its own token: one cached in memory by one bench is not found there by another)
+        B.sharedPlain = Sanctum.createToken(new Member(43), "shared", ["read"], Time.now() + 86400).plainText
+        B.storePlain = Sanctum.createToken(new Member(44), "store", ["read"], Time.now() + 86400).plainText
         B.token = t.token
         B.text = Sanctum.encode(t.token)
     }
@@ -34,11 +39,11 @@ bench "lookup: memory" {
 }
 bench "lookup: shared cache" {
     B.setup(); if (Sanctum.shared == null) { Sanctum.shared = new MemoryCacheStore() }; Sanctum.cacheSeconds = 0
-    B.n += Sanctum.findToken(B.plain).id
+    B.n += Sanctum.findToken(B.sharedPlain).id
 }
 bench "lookup: store, no cache" {
     B.setup(); Sanctum.shared = null; Sanctum.cacheSeconds = 0
-    B.n += Sanctum.findToken(B.plain).id
+    B.n += Sanctum.findToken(B.storePlain).id
 }
 bench "encode" { B.setup(); B.n += Sanctum.encode(B.token).length }
 bench "decode" { B.setup(); B.n += Sanctum.decode(B.text).id }
