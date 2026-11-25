@@ -1,0 +1,45 @@
+// grav bench bench/tokens.grav — what a token lookup costs: from memory, from
+// the shared cache (memory off, as in another process), and from the store;
+// and the cached text's encode and decode.
+import "std"
+import "grav-cache"
+import "../src/all.grav"
+use apogee.*
+use cache.*
+
+class Member implements Authenticatable {
+    public id: long
+    constructor(id: long) { self.id = id }
+    fn authId() -> string { return str(self.id) }
+    fn authPassword() -> string { return "" }
+}
+class B {
+    static plain: string = ""
+    static token: PersonalAccessToken = null
+    static text: string = ""
+    static n: long = 0
+    static fn setup() {
+        if (B.plain != "") { return }
+        Sanctum.use(new MemoryAccessTokenStore())
+        let t = Sanctum.createToken(new Member(42), "deploy script", ["servers:read", "deploy"], Time.now() + 86400)
+        B.plain = t.plainText
+        B.token = t.token
+        B.text = Sanctum.encode(t.token)
+    }
+}
+
+bench "lookup: memory" {
+    B.setup(); Sanctum.shared = null; Sanctum.cacheSeconds = 5
+    B.n += Sanctum.findToken(B.plain).id
+}
+bench "lookup: shared cache" {
+    B.setup(); if (Sanctum.shared == null) { Sanctum.shared = new MemoryCacheStore() }; Sanctum.cacheSeconds = 0
+    B.n += Sanctum.findToken(B.plain).id
+}
+bench "lookup: store, no cache" {
+    B.setup(); Sanctum.shared = null; Sanctum.cacheSeconds = 0
+    B.n += Sanctum.findToken(B.plain).id
+}
+bench "encode" { B.setup(); B.n += Sanctum.encode(B.token).length }
+bench "decode" { B.setup(); B.n += Sanctum.decode(B.text).id }
+bench "sha256 of the secret" { B.setup(); B.n += Hash.sha256(B.plain).length }
