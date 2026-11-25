@@ -15,5 +15,7 @@ compiler versions it builds with.
   behind the in-memory one: tokens are found there by every process, revoking
   removes them from it, unknown ids are remembered briefly, and a failing cache
   is skipped. Cached as tab-separated text (a tenth of JSON's cost).
+- Tokens in memory are bounded (`sanctum.memory_tokens`, std's `LruCache`);
+  needs grav 1.13.0 or newer.
 - `SanctumPackage`: connects itself to an apogee-framework app (settings, the
   guard, the middleware, the migration, `sanctum:prune-expired`).

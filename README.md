@@ -43,6 +43,7 @@ Sanctum.revoke(t.token.id)
 | `sanctum.guard` | `web`: the session guard for the front end |
 | `sanctum.cache` | `SANCTUM_CACHE`: `""` (memory only), `default` (the app's cache store) or a store's name |
 | `sanctum.cache_seconds` | seconds a token stays in a process's memory: 5, or 1 with a shared cache |
+| `sanctum.memory_tokens` | 10000: the most tokens kept in a process's memory (the least recently used go first) |
 | `sanctum.shared_seconds`, `sanctum.miss_seconds` | 60 (a token in the shared cache), 5 (an unknown id remembered) |
 | `sanctum.touch_every` | 60: `last_used_at` written at most this often |
 
