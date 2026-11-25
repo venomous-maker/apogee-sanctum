@@ -41,7 +41,21 @@ Sanctum.revoke(t.token.id)
 | `sanctum.expiration` | `SANCTUM_EXPIRATION`, minutes a new token lasts (0: until revoked) |
 | `sanctum.stateful` | `SANCTUM_STATEFUL_DOMAINS`, else localhost, 127.0.0.1 and `APP_URL`'s host |
 | `sanctum.guard` | `web`: the session guard for the front end |
-| `sanctum.touch_every`, `sanctum.cache_seconds` | 60, 5 |
+| `sanctum.cache` | `SANCTUM_CACHE`: `""` (memory only), `default` (the app's cache store) or a store's name |
+| `sanctum.cache_seconds` | seconds a token stays in a process's memory: 5, or 1 with a shared cache |
+| `sanctum.shared_seconds`, `sanctum.miss_seconds` | 60 (a token in the shared cache), 5 (an unknown id remembered) |
+| `sanctum.touch_every` | 60: `last_used_at` written at most this often |
+
+## Caching
+
+A lookup checks this process's memory, then the shared cache (when
+`sanctum.cache` names one), then the database. Ids that don't exist are
+remembered briefly, so a stream of bad tokens costs no queries. Revoking
+removes the token from the shared cache at once; other processes stop
+accepting it within `cache_seconds` (1 second with a shared cache). A shared
+cache that fails is skipped: the database answers. Costs are measured by
+`grav bench bench/tokens.grav`: about 1.3 µs from memory and 4.6 µs from an
+in-process shared cache (a Redis round trip adds its network time).
 
 ## Stores
 
@@ -56,6 +70,7 @@ tests. Outside the framework, set `Sanctum.use(store)`, `Sanctum.provider`,
 ```sh
 grav test tests/sanctum.grav
 grav test tests/package.grav
+grav test tests/shared.grav
 SANCTUM_MYSQL_URL=mysql://… SANCTUM_POSTGRES_URL=postgres://… grav test tests/sanctum.grav
 ```
 

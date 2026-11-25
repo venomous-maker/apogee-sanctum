@@ -11,5 +11,9 @@ compiler versions it builds with.
   the abilities: and ability: middleware.
 - `PersonalAccessToken` as an Orbit model with its migration; an Orbit store
   (SQLite, MySQL, PostgreSQL) and a memory one.
+- A shared cache (`sanctum.cache`: the app's cache store or a named one)
+  behind the in-memory one: tokens are found there by every process, revoking
+  removes them from it, unknown ids are remembered briefly, and a failing cache
+  is skipped. Cached as tab-separated text (a tenth of JSON's cost).
 - `SanctumPackage`: connects itself to an apogee-framework app (settings, the
   guard, the middleware, the migration, `sanctum:prune-expired`).
