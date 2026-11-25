@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.0 (2026-11-25)
+
 - Personal access tokens (hashed, with abilities, expiry, last_used_at and
   revocation), `SanctumGuard` with the session fallback for the front end, and
   the abilities: and ability: middleware.
