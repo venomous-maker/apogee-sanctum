@@ -29,11 +29,13 @@ namespace apogee {
                     // "" (none), "default" (the app's cache store) or a store's name (Cache.store(s, name))
                     "sanctum.cache": Env.get("SANCTUM_CACHE", ""),
                     "sanctum.shared_seconds": 60,
-                    "sanctum.miss_seconds": 5};
+                    "sanctum.miss_seconds": 5,
+                    "sanctum.memory_tokens": 10000};
         }
         fn migrations() -> Array<any> { return [new CreatePersonalAccessTokensTable() as any]; }
         fn commands() -> Array<any> { return [new PruneTokensCommand() as any]; }
         fn boot(app: PackageContext) {
+            Sanctum.memoryTokens = Config.getInt("sanctum.memory_tokens", 10000) as int;
             Sanctum.use(new OrbitAccessTokenStore());
             Sanctum.expirationMinutes = Config.getInt("sanctum.expiration", 0);
             Sanctum.touchEverySeconds = Config.getInt("sanctum.touch_every", 60);

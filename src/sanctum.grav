@@ -25,10 +25,10 @@ namespace apogee {
         constructor(token: PersonalAccessToken, plainText: string) { self.token = token; self.plainText = plainText; }
     }
 
+    // A looked-up token in memory (null: the id is unknown).
     class CachedToken {
         public token: PersonalAccessToken
-        public at: long
-        constructor(token: PersonalAccessToken, at: long) { self.token = token; self.at = at; }
+        constructor(token: PersonalAccessToken) { self.token = token; }
     }
 
     class Sanctum {
@@ -47,7 +47,9 @@ namespace apogee {
         // Seconds a looked-up token is kept in this process's memory (revoking
         // here drops it at once; elsewhere it is seen within this long).
         static cacheSeconds: long = 5
-        private static cache: ConcurrentMap<long, CachedToken> = new ConcurrentMap<long, CachedToken>()
+        // At most this many tokens are kept in memory (the least recently used go first).
+        static memoryTokens: int = 10000
+        private static cache: LruCache<long, CachedToken> = new LruCache<long, CachedToken>(10000)
         // A cache shared by every process and server (Redis, files, a table),
         // behind the memory one; null: none. Revoking removes a token from it.
         static shared: CacheStore = null
@@ -81,7 +83,7 @@ namespace apogee {
                    t.tokenHash + "\t" + t.abilities + "\t" + t.name;
         }
         static fn decode(text: string) -> PersonalAccessToken {
-            let p = Str.split(text, "\t");
+            let p = Str.split(text, "\t", 10);                                 // (the name, last, may hold tabs)
             if (p.size() < 10 || p[0] != "1") { return null; }
             let t = new PersonalAccessToken();
             t.id = Format.toLongOr(p[1], 0);
@@ -93,7 +95,7 @@ namespace apogee {
             t.ownerId = p[6];
             t.tokenHash = p[7];
             t.abilities = p[8];
-            t.name = p.size() == 10 ? p[9] : Str.join(p[9..], "\t");
+            t.name = p[9];
             return t;
         }
         // Seconds to keep `t` in the shared cache (never past its expiry).
@@ -104,7 +106,10 @@ namespace apogee {
         }
 
         // Keeps tokens in `store` (and forgets what was cached from the last one).
-        static fn use(store: AccessTokenStore) { Sanctum.store = store; Sanctum.cache.clear(); }
+        static fn use(store: AccessTokenStore) {
+            Sanctum.store = store;
+            Sanctum.cache = new LruCache<long, CachedToken>(Sanctum.memoryTokens < 1 ? 1 : Sanctum.memoryTokens);
+        }
         // The owner of a token: its class name and id.
         static fn ownerType(user: any) -> string { let info = ClassInfo.of(user); return info == null ? typename(user) : info.name; }
         static fn ownerId(user: any) -> string { return (user as Authenticatable).authId(); }
@@ -146,12 +151,11 @@ namespace apogee {
             if (!Str.isDigits(idText) || idText.length > 18) { return null; }
             let id = Format.toLongOr(idText, 0);
             let now = Time.now();
-            let nowMs = Time.monotonicMs();
             // memory, then the shared cache, then the store; an unknown id is
             // remembered (a null token) so a flood of bad ids costs no queries
             let c = Sanctum.cache.getOr(id, null);
             let t: PersonalAccessToken = null;
-            if (c != null && nowMs - c.at < (c.token == null ? Sanctum.missSeconds : Sanctum.cacheSeconds) * 1000) { t = c.token; }
+            if (c != null) { t = c.token; }
             else {
                 let found = false;
                 let raw = Sanctum.sharedGet(id);
@@ -163,7 +167,8 @@ namespace apogee {
                     t = Sanctum.store.find(id);
                     Sanctum.sharedPut(id, t == null ? "-" : Sanctum.encode(t), t == null ? Sanctum.missSeconds : Sanctum.sharedTtl(t, now));
                 }
-                Sanctum.cache.put(id, new CachedToken(t, nowMs));
+                let keep = (t == null ? Sanctum.missSeconds : Sanctum.cacheSeconds) * 1000;
+                if (keep > 0) { Sanctum.cache.putFor(id, new CachedToken(t), keep); }
             }
             if (t == null) { return null; }
             if (!Hash.equals(t.tokenHash, Hash.sha256(plain[bar + 1..])) || t.expired(now)) { return null; }
