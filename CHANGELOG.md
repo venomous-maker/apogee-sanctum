@@ -19,3 +19,7 @@ compiler versions it builds with.
   needs grav 1.13.0 or newer.
 - `SanctumPackage`: connects itself to an apogee-framework app (settings, the
   guard, the middleware, the migration, `sanctum:prune-expired`).
+
+### Dependencies
+
+- Uses apogee-http 0.3.0, apogee-routing 0.3.0, apogee-auth 0.2.2, apogee-console 0.2.2, apogee-package 0.1.0, grav-orbit 0.3.0, grav-cache 0.2.2, apogee-session 0.2.2, apogee-testing 0.1.1 (from their GitHub tags).
