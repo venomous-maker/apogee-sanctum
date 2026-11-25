@@ -9,7 +9,7 @@ In an apogee-framework app, importing the module is all it takes:
 `abilities:` and `ability:` middleware, the `personal_access_tokens` migration
 (run it with `migrate`) and `sanctum:prune-expired`.
 
-```grav
+```typescript
 import "std"
 import "apogee-sanctum"
 use apogee.*
