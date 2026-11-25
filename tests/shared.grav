@@ -1,0 +1,104 @@
+// The shared cache behind the memory one: a second process (memory off)
+// finds tokens there, not in the store; revoking removes them everywhere;
+// unknown ids are remembered; a cache that fails never stops a sign-in.
+import "std"
+import "grav-cache"
+import "../src/all.grav"
+use apogee.*
+use cache.*
+
+class Member implements Authenticatable {
+    public id: long
+    constructor(id: long) { self.id = id }
+    fn authId() -> string { return str(self.id) }
+    fn authPassword() -> string { return "" }
+}
+
+// Counts the lookups that reach the store.
+class CountingStore extends MemoryAccessTokenStore {
+    public finds: int = 0
+    constructor() {}
+    fn find(id: long) -> PersonalAccessToken { self.finds += 1; return super.find(id) }
+}
+
+class BrokenCache implements CacheStore {
+    constructor() {}
+    fn get(key: string) -> string? { throw new IOError("down") }
+    fn put(key: string, value: string, ttlSeconds: long) { throw new IOError("down") }
+    fn forget(key: string) -> bool { throw new IOError("down") }
+    fn increment(key: string, by: long) -> long { throw new IOError("down") }
+    fn flush() { throw new IOError("down") }
+}
+
+test "a token is found in the shared cache, and revoking removes it" {
+    let store = new CountingStore()
+    Sanctum.use(store)
+    let shared = new MemoryCacheStore()
+    Sanctum.shared = shared
+    let t = Sanctum.createToken(new Member(1), "cli", ["read", "write"], Time.now() + 3600)
+    assertEq(Sanctum.findToken(t.plainText).name, "cli")
+    assertEq(store.finds, 1)
+    // another process: nothing in its memory
+    Sanctum.cacheSeconds = 0
+    let again = Sanctum.findToken(t.plainText)
+    assertEq(store.finds, 1)                                           // from the shared cache
+    assertEq(again.ownerId, "1")
+    assert(again.can("write") && !again.can("admin"))
+    assertEq(again.expiresAt, t.token.expiresAt)
+    assertEq(Sanctum.findToken(str(t.token.id) + "|wrong"), null)
+    // revoked in one process: gone for every other one
+    Sanctum.revoke(t.token.id)
+    assertEq(shared.get("sanctum:token:" + str(t.token.id)), null)
+    assertEq(Sanctum.findToken(t.plainText), null)
+    Sanctum.cacheSeconds = 5
+    Sanctum.shared = null
+}
+
+test "unknown ids are remembered; a new token is not blocked by that" {
+    let store = new CountingStore()
+    Sanctum.use(store)
+    Sanctum.shared = new MemoryCacheStore()
+    for (i in 0..50) { assertEq(Sanctum.findToken("1|nope"), null) }
+    assertEq(store.finds, 1)
+    let t = Sanctum.createToken(new Member(1), "first")                 // id 1, looked up before it existed
+    assertEq(t.token.id, 1 as long)
+    assert(Sanctum.findToken(t.plainText) != null)
+    Sanctum.shared = null
+}
+
+test "last_used_at is written once, and the shared copy follows" {
+    let store = new CountingStore()
+    Sanctum.use(store)
+    Sanctum.shared = new MemoryCacheStore()
+    let t = Sanctum.createToken(new Member(1), "cli")
+    Sanctum.findToken(t.plainText)
+    Sanctum.cacheSeconds = 0
+    let seen = Sanctum.findToken(t.plainText)
+    assert(seen.lastUsedAt > 0)                                          // the shared copy carries the touch
+    assertEq(store.finds, 1)
+    Sanctum.cacheSeconds = 5
+    Sanctum.shared = null
+}
+
+test "a cache that fails never stops a sign-in" {
+    Sanctum.use(new MemoryAccessTokenStore())
+    Sanctum.shared = new BrokenCache()
+    let t = Sanctum.createToken(new Member(1), "cli")
+    assert(Sanctum.findToken(t.plainText) != null)
+    assert(Sanctum.revoke(t.token.id))
+    assertEq(Sanctum.findToken(t.plainText), null)
+    Sanctum.shared = null
+}
+
+test "the cached text keeps every field, and any name" {
+    let t = new PersonalAccessToken()
+    t.id = 7; t.ownerType = "app.User"; t.ownerId = "42"; t.name = "tab\there, | and \"quotes\""
+    t.tokenHash = Hash.sha256("x"); t.abilities = "a,b"; t.lastUsedAt = 5; t.expiresAt = 9; t.issuedAt = 3
+    let back = Sanctum.decode(Sanctum.encode(t))
+    assertEq(back.id, 7 as long); assertEq(back.name, t.name); assertEq(back.ownerType, "app.User"); assertEq(back.ownerId, "42")
+    assertEq(back.tokenHash, t.tokenHash); assertEq(back.abilities, "a,b")
+    assertEq(back.lastUsedAt, 5 as long); assertEq(back.expiresAt, 9 as long); assertEq(back.issuedAt, 3 as long)
+    assertEq(Sanctum.decode("garbage"), null)
+    t.ownerId = "odd\tid"
+    assertEq(Sanctum.encode(t), "")                                   // not cached
+}
