@@ -9,10 +9,12 @@
 // A request without a token from one of `stateful`'s hosts (the app's own
 // front end) is signed in by the session cookie instead, through `sessionGuard`.
 import "std"
+import "grav-cache"
 import "apogee-http"
 import "apogee-routing"
 import "apogee-auth"
 import "tokens.grav"
+use cache.*
 
 namespace apogee {
 
@@ -42,9 +44,64 @@ namespace apogee {
         static expirationMinutes: long = 0
         // last_used_at is written at most this often per token (seconds), not on every request.
         static touchEverySeconds: long = 60
-        // Seconds a looked-up token is kept in memory (revoking here drops it at once).
+        // Seconds a looked-up token is kept in this process's memory (revoking
+        // here drops it at once; elsewhere it is seen within this long).
         static cacheSeconds: long = 5
         private static cache: ConcurrentMap<long, CachedToken> = new ConcurrentMap<long, CachedToken>()
+        // A cache shared by every process and server (Redis, files, a table),
+        // behind the memory one; null: none. Revoking removes a token from it.
+        static shared: CacheStore = null
+        // Seconds a token is kept there, and an unknown id remembered (memory and shared).
+        static sharedSeconds: long = 60
+        static missSeconds: long = 5
+        private static fn key(id: long) -> string { return "sanctum:token:" + str(id); }
+        // (a cache that fails never stops a sign-in: the store answers)
+        private static fn sharedGet(id: long) -> string? {
+            let c = Sanctum.shared;
+            if (c == null) { return null; }
+            try { return c.get(Sanctum.key(id)); } catch (e: Exception) { return null; }
+        }
+        private static fn sharedPut(id: long, value: string, ttl: long) {
+            let c = Sanctum.shared;
+            if (c == null || ttl <= 0 || value == "") { return; }
+            try { c.put(Sanctum.key(id), value, ttl); } catch (e: Exception) {}
+        }
+        private static fn forget(id: long) {
+            Sanctum.cache.remove(id);
+            let c = Sanctum.shared;
+            if (c != null) { try { c.forget(Sanctum.key(id)); } catch (e: Exception) {} }
+        }
+        // A token as cached text, and back: tab-separated, a version first and
+        // the name last (so it may hold anything); "" when a field other than
+        // the name holds a tab (such a token is simply not cached).
+        // (about ten times cheaper than JSON: see bench/tokens.grav)
+        static fn encode(t: PersonalAccessToken) -> string {
+            if (Str.contains(t.ownerType + t.ownerId + t.tokenHash + t.abilities, "\t")) { return ""; }
+            return "1\t${t.id}\t${t.expiresAt}\t${t.lastUsedAt}\t${t.issuedAt}\t" + t.ownerType + "\t" + t.ownerId + "\t" +
+                   t.tokenHash + "\t" + t.abilities + "\t" + t.name;
+        }
+        static fn decode(text: string) -> PersonalAccessToken {
+            let p = Str.split(text, "\t");
+            if (p.size() < 10 || p[0] != "1") { return null; }
+            let t = new PersonalAccessToken();
+            t.id = Format.toLongOr(p[1], 0);
+            if (t.id <= 0) { return null; }
+            t.expiresAt = Format.toLongOr(p[2], 0);
+            t.lastUsedAt = Format.toLongOr(p[3], 0);
+            t.issuedAt = Format.toLongOr(p[4], 0);
+            t.ownerType = p[5];
+            t.ownerId = p[6];
+            t.tokenHash = p[7];
+            t.abilities = p[8];
+            t.name = p.size() == 10 ? p[9] : Str.join(p[9..], "\t");
+            return t;
+        }
+        // Seconds to keep `t` in the shared cache (never past its expiry).
+        private static fn sharedTtl(t: PersonalAccessToken, now: long) -> long {
+            let ttl = Sanctum.sharedSeconds;
+            if (t.expiresAt > 0 && t.expiresAt - now < ttl) { ttl = t.expiresAt - now; }
+            return ttl;
+        }
 
         // Keeps tokens in `store` (and forgets what was cached from the last one).
         static fn use(store: AccessTokenStore) { Sanctum.store = store; Sanctum.cache.clear(); }
@@ -65,15 +122,18 @@ namespace apogee {
             let secret = Hash.randomToken(20);
             t.tokenHash = Hash.sha256(secret);
             Sanctum.store.insert(t);
+            Sanctum.forget(t.id);                              // (an id looked up before it existed is remembered as unknown)
             return new NewAccessToken(t, str(t.id) + "|" + secret);
         }
         static fn tokensOf(user: any) -> Array<PersonalAccessToken> { return Sanctum.store.ofOwner(Sanctum.ownerType(user), Sanctum.ownerId(user)); }
         // Revokes one token (by id); whether it existed.
-        static fn revoke(id: long) -> bool { Sanctum.cache.remove(id); return Sanctum.store.delete(id); }
+        static fn revoke(id: long) -> bool { let had = Sanctum.store.delete(id); Sanctum.forget(id); return had; }
         // Revokes every token of `user`; how many.
         static fn revokeAll(user: any) -> long {
-            for (t in Sanctum.tokensOf(user)) { Sanctum.cache.remove(t.id); }
-            return Sanctum.store.deleteOfOwner(Sanctum.ownerType(user), Sanctum.ownerId(user));
+            let ids = Sanctum.tokensOf(user).mapTo(fn(t: PersonalAccessToken) -> long => t.id);
+            let n = Sanctum.store.deleteOfOwner(Sanctum.ownerType(user), Sanctum.ownerId(user));
+            for (id in ids) { Sanctum.forget(id); }
+            return n;
         }
         // Removes tokens that expired more than `hours` ago; how many.
         static fn prune(hours: long = 24) -> long { return Sanctum.store.pruneExpired(Time.now() - hours * 3600); }
@@ -87,18 +147,31 @@ namespace apogee {
             let id = Format.toLongOr(idText, 0);
             let now = Time.now();
             let nowMs = Time.monotonicMs();
+            // memory, then the shared cache, then the store; an unknown id is
+            // remembered (a null token) so a flood of bad ids costs no queries
             let c = Sanctum.cache.getOr(id, null);
             let t: PersonalAccessToken = null;
-            if (c != null && nowMs - c.at < Sanctum.cacheSeconds * 1000) { t = c.token; }
+            if (c != null && nowMs - c.at < (c.token == null ? Sanctum.missSeconds : Sanctum.cacheSeconds) * 1000) { t = c.token; }
             else {
-                t = Sanctum.store.find(id);
-                if (t == null) { Sanctum.cache.remove(id); return null; }
+                let found = false;
+                let raw = Sanctum.sharedGet(id);
+                if (raw != null) {
+                    t = raw == "-" ? null : Sanctum.decode(raw);
+                    found = raw == "-" || t != null;
+                }
+                if (!found) {
+                    t = Sanctum.store.find(id);
+                    Sanctum.sharedPut(id, t == null ? "-" : Sanctum.encode(t), t == null ? Sanctum.missSeconds : Sanctum.sharedTtl(t, now));
+                }
                 Sanctum.cache.put(id, new CachedToken(t, nowMs));
             }
+            if (t == null) { return null; }
             if (!Hash.equals(t.tokenHash, Hash.sha256(plain[bar + 1..])) || t.expired(now)) { return null; }
             if (now - t.lastUsedAt >= Sanctum.touchEverySeconds) {
                 t.lastUsedAt = now;
                 try { Sanctum.store.touch(t.id, now); } catch (e: Exception) {}
+                // (the shared copy too, or every process would touch it again)
+                Sanctum.sharedPut(t.id, Sanctum.encode(t), Sanctum.sharedTtl(t, now));
             }
             return t;
         }
